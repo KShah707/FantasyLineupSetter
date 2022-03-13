@@ -12,8 +12,7 @@ pip install --target ./dependencies  -r requirements.txt
 cd dependencies
 zip -r ../deployment-package.zip .
 cd ..
-zip -g deployment-package.zip fantasy_lineup_setter.py
-zip -g deployment-package.zip oauth_key.json
+zip -g deployment-package.zip fantasy_lineup_setter.py oauth_key.json
 ```
 2. Create an AWS Lambda function and upload this zipfile as the function source code
 3. Change the function configurations

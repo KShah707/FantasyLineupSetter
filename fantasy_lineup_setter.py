@@ -3,6 +3,7 @@ import pytz
 from collections import Counter
 import requests
 import shutil
+from itertools import chain
 
 from yahoo_oauth import OAuth2
 import yahoo_fantasy_api as yfa
@@ -16,7 +17,7 @@ class NHLScraper():
         standings = requests.get(self.url_prefix + 'standings').json()
         N_DIVISIONS = 4
         for div in range(N_DIVISIONS):
-            div_records = requests.get(self.url_prefix + 'standings').json()['records'][div]['teamRecords']
+            div_records = standings['records'][div]['teamRecords']
             for record in div_records:
                 self._teams[record['team']['id']] = record['team']
 
@@ -49,6 +50,43 @@ class NHLScraper():
                 team_game[name] = None
 
         return team_game
+
+
+class BacktrackingLineupSolver:
+    def __init__(self, slots, players):
+        self.slot_names = slots
+        self.slot_pids = [None] * len(slots)
+        self.players = players
+        self.solutions = []
+
+    def solve(self, slot_index):
+        if slot_index == len(self.slot_names):
+            # Reached the end, record our solution
+            self.solutions.append(dict(zip(self.slot_pids, self.slot_names)))
+            return
+
+        atleast_one_player = False
+
+        # For each active player,
+        for pid, player in self.players.items():
+            # If player can be put in this slot,
+            if (
+                pid not in self.slot_pids
+                and self.slot_names[slot_index] in set(chain.from_iterable(d.values() for d in player["eligible_positions"]))
+            ):
+                # Put player in this slot and recurse on remaining slots
+                atleast_one_player = True
+                self.slot_pids[slot_index] = pid
+                self.solve(slot_index + 1)
+
+        # If no player will fit here, then skip slot and keep going
+        if not atleast_one_player:
+            self.slot_pids[slot_index] = None
+            self.solve(slot_index + 1)
+
+    def solve_lineup(self):
+        self.solve(0)
+        return self.solutions
 
 
 def set_lineup_handler(event, context):
@@ -90,58 +128,52 @@ def set_lineup_handler(event, context):
     nhl = NHLScraper()
     team_game = nhl.get_next_game_by_team(start_dt=day)
 
-    ######################################
-    #%% See which players can be moved %%#
-    ######################################
-    # TODO improve starting players algorithm
+    # #################################
+    # #%% Generate possible lineups %%#
+    # #################################
     STARTING_SLOTS = Counter({pos: posinfo['count'] for pos, posinfo in lg.positions().items() if posinfo['is_starting_position']})
-    starters = {}
-    startables = {}
-    benchables = {}
 
+    actives = {}
+    inactives = {}
     for pid, player in players.items():
         player["tonights_game"] = team_game[player["editorial_team_full_name"]]
-        if player["tonights_game"] and player["selected_position"] in STARTING_SLOTS:
-            starters[pid] = player
-        elif player["tonights_game"] and player["selected_position"] == "BN":
-            startables[pid] = player
-        elif not player["tonights_game"] and player["selected_position"] in STARTING_SLOTS:
-            benchables[pid] = player
+        if player["tonights_game"] and (player["selected_position"] in STARTING_SLOTS or player["selected_position"] == "BN"):
+            actives[pid] = player
+        elif not player["tonights_game"] and (player["selected_position"] in STARTING_SLOTS or player["selected_position"] == "BN"):
+            inactives[pid] = player
 
-    print("Starters", [p["name"]["full"] for p in starters.values()])
-    print("Startables", [p["name"]["full"] for p in startables.values()])
-    print("Benchables", [p["name"]["full"] for p in benchables.values()])
+    slot_names = list(STARTING_SLOTS.elements())
+    lineup_solver = BacktrackingLineupSolver(slot_names, actives)
+    solutions = lineup_solver.solve_lineup()
+
+    #################################
+    #%% Pick best possible lineup %%#
+    #################################
+    solution = solutions[0]
 
     ##########################
     #%% Submit API request %%#
     ##########################
-    available_ct = STARTING_SLOTS - Counter(starter["selected_position"] for starter in starters.values())
-
     new_positions = []
-    for sid, startable in startables.items():
-        # available starting position for the player
-        eligible_pos = Counter([posdict["position"] for posdict in startable["eligible_positions"]])
 
-        try:
-            new_pos = next((eligible_pos & available_ct).elements())
+    for pid, pos in solution.items():
+        if pid:
             new_positions.append({
-                "player_id": sid,
-                "selected_position": new_pos
+                "player_id": pid,
+                "selected_position": pos
             })
-            available_ct.subtract(new_pos)
-            bid, benchable = benchables.popitem()
-            new_positions.append({
-                "player_id": bid,
-                "selected_position": "BN"
-            })
-        except StopIteration:
-            pass
+    for pid, player in inactives.items():
+        new_positions.append({
+            "player_id": pid,
+            "selected_position": "BN"
+        })
 
-    if new_positions:
-        tm.change_positions(day, new_positions)
-        print("Update Succeeded!")
-        for row in new_positions:
-            print(f"Moved {players[row['player_id']]['name']['full']} to {row['selected_position']}")
-    else:
-        print("No Changes Needed!")
+    print("Attempting to set the following lineup:")
+    for row in new_positions:
+        print(f"{row['selected_position']}: {players[row['player_id']]['name']['full']}")
+    tm.change_positions(day, new_positions)
+    print("Update Succeeded!")
+
+if __name__ == '__main__':
+    set_lineup_handler(None, None)
 
